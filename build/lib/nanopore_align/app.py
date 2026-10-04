@@ -16,7 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Tuple
 
-from .alignment import AlignmentError, solve_alignment
+from .alignment import AlignmentError, AnchorValidationError, solve_alignment
 
 LOGGER = logging.getLogger("nanopore_align")
 
@@ -29,6 +29,7 @@ _ALLOWED_FIELDS = {
     "dwell_min",
     "dwell_max",
     "max_skips",
+    "anchors",
 }
 
 _REQUIRED_FIELDS = (
@@ -70,9 +71,19 @@ def align_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         kwargs["dwell_max"] = payload["dwell_max"]
     if "max_skips" in payload:
         kwargs["max_skips"] = payload["max_skips"]
+    if "anchors" in payload:
+        kwargs["anchors"] = payload["anchors"]
 
     try:
         result = solve_alignment(**kwargs)
+    except AnchorValidationError as exc:
+        # 锚点越界/重复/次序冲突：字段级错误，便于质控人员订正录入。
+        return HTTPStatus.BAD_REQUEST, {
+            "feasible": False,
+            "error": "invalid_anchors",
+            "field": exc.field,
+            "message": str(exc),
+        }
     except AlignmentError as exc:
         return _bad_request("invalid_request", str(exc))
     except TypeError as exc:

@@ -7,7 +7,11 @@ import random
 import unittest
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from nanopore_align.alignment import AlignmentError, solve_alignment
+from nanopore_align.alignment import (
+    AlignmentError,
+    AnchorValidationError,
+    solve_alignment,
+)
 
 
 def brute_force(
@@ -19,10 +23,16 @@ def brute_force(
     dwell_min: int,
     dwell_max: int,
     max_skips: int,
+    anchors: Optional[Sequence[dict]] = None,
 ) -> Optional[dict]:
     """穷举所有漂移 / 含首尾子序列 / 停留组合，返回与 solve 同口径的最优解。"""
     R = len(reference)
     N = len(observations)
+    anchor_by_ref = (
+        {a["reference_index"]: a["sample_index"] for a in anchors}
+        if anchors
+        else {}
+    )
     best: Optional[Tuple] = None
 
     for d in range(drift_min, drift_max + 1):
@@ -34,12 +44,28 @@ def brute_force(
                 k = len(used)
                 if k > N or k * dwell_min > N or k * dwell_max < N:
                     continue
+                # 锚定参考级不得被跳过。
+                if any(ri in set(skipped) for ri in anchor_by_ref):
+                    continue
                 for dwells in itertools.product(
                     range(dwell_min, dwell_max + 1), repeat=k
                 ):
                     if sum(dwells) != N:
                         continue
                     boundaries = tuple(itertools.accumulate(dwells))
+                    # 锚定观测必须归属锚定级的连续采样区间。
+                    if anchor_by_ref:
+                        pos = {ri: slot for slot, ri in enumerate(used)}
+                        starts = (0,) + boundaries[:-1]
+                        if any(
+                            not (
+                                starts[pos[ri]]
+                                <= t
+                                < starts[pos[ri]] + dwells[pos[ri]]
+                            )
+                            for ri, t in anchor_by_ref.items()
+                        ):
+                            continue
                     total = 0
                     worst = 0
                     ok = True
@@ -86,6 +112,7 @@ def _assert_matches_brute(
     dwell_min: int = 1,
     dwell_max: int = 3,
     max_skips: int = 2,
+    anchors: Optional[Sequence[dict]] = None,
 ) -> None:
     got = solve_alignment(
         reference,
@@ -96,6 +123,7 @@ def _assert_matches_brute(
         dwell_min,
         dwell_max,
         max_skips,
+        anchors=anchors,
     )
     want = brute_force(
         reference,
@@ -106,6 +134,7 @@ def _assert_matches_brute(
         dwell_min,
         dwell_max,
         max_skips,
+        anchors=anchors,
     )
     if want is None:
         testcase.assertFalse(got["feasible"], msg=f"意外可行: {got}")
@@ -118,6 +147,34 @@ def _assert_matches_brute(
     testcase.assertEqual(got["boundaries"], want["boundaries"])
     got_used = [lv["reference_index"] for lv in got["levels"]]
     testcase.assertEqual(got_used, want["used_indices"])
+    if anchors:
+        _assert_anchor_evidence(testcase, got, anchors)
+
+
+def _assert_anchor_evidence(
+    testcase: unittest.TestCase, got: dict, anchors: Sequence[dict]
+) -> None:
+    """逐项锚定归属证据必须与请求锚点一一对应且落在采样区间内。"""
+    assignments = got.get("anchor_assignments")
+    testcase.assertIsInstance(assignments, list)
+    testcase.assertEqual(len(assignments), len(anchors))
+    level_by_order = {lv["level_order"]: lv for lv in got["levels"]}
+    for want, ev in zip(anchors, assignments):
+        testcase.assertEqual(ev["reference_index"], want["reference_index"])
+        testcase.assertEqual(ev["sample_index"], want["sample_index"])
+        lv = level_by_order[ev["level_order"]]
+        testcase.assertEqual(lv["reference_index"], want["reference_index"])
+        testcase.assertEqual(ev["sample_start"], lv["sample_start"])
+        testcase.assertEqual(ev["sample_end"], lv["sample_end"])
+        testcase.assertLessEqual(lv["sample_start"], want["sample_index"])
+        testcase.assertLess(want["sample_index"], lv["sample_end"])
+        testcase.assertEqual(ev["adopted_level"], lv["adopted_level"])
+        sample_ev = {
+            s["index"]: s for s in lv["samples"]
+        }[want["sample_index"]]
+        testcase.assertEqual(ev["observed"], sample_ev["observed"])
+        testcase.assertEqual(ev["residual"], sample_ev["residual"])
+        testcase.assertEqual(ev["residual"], ev["observed"] - ev["adopted_level"])
 
 
 class ExactAlignmentTests(unittest.TestCase):
@@ -274,6 +331,22 @@ class ObjectiveOrderTests(unittest.TestCase):
         # 内部边界字典序最小。
         self.assertEqual(res["boundaries"], [1, 2, 3, 4, 5, 6, 7])
 
+    def test_boundary_tie_break_not_shadowed_by_prefix_max(self) -> None:
+        # 回归：两条前缀的 (跳过数, 残差和) 相同但前缀最大残差不同
+        # （2 vs 3），而末级残差 8 把两者最终最大残差都拉平到 8；
+        # 此时必须按边界字典序裁决，不能因前缀最大残差较差而提前
+        # 剪掉字典序更小的分支。
+        ref = [10, 38, -24, -22, -20, -21, 13, 40, 48]
+        obs = [14, 44, -20, -18, -17, -19, -15, -16, 42, 42, 44, 51]
+        res = solve_alignment(ref, obs, 2, 5, 8,
+                              dwell_min=1, dwell_max=2, max_skips=1)
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["num_skips"], 1)
+        self.assertEqual(res["residual_sum"], 21)
+        self.assertEqual(res["max_abs_residual"], 8)
+        self.assertEqual(res["drift"], 4)
+        self.assertEqual(res["boundaries"], [1, 2, 3, 5, 7, 8, 10])
+
 
 class ValidationTests(unittest.TestCase):
     def _base(self) -> dict:
@@ -395,6 +468,363 @@ class ResidualEvidenceTests(unittest.TestCase):
         )
 
 
+class AnchoredAlignmentTests(unittest.TestCase):
+    """硬锚点：锚定级不可跳过、锚定观测必须归属该级采样区间。"""
+
+    def test_anchor_satisfied_keeps_result_and_gives_evidence(self) -> None:
+        # 锚点被无锚点最优解自然满足：裁决结果不变，且给出逐项归属证据。
+        ref = [10, 20, 30, 40, 50, 60, 70, 80]
+        obs = [12, 19, 31, 38, 52, 58, 71, 79]
+        anchors = [
+            {"reference_index": 2, "sample_index": 2},
+            {"reference_index": 5, "sample_index": 5},
+        ]
+        base = solve_alignment(ref, obs, -5, 5, 2, dwell_min=1, dwell_max=1)
+        res = solve_alignment(
+            ref, obs, -5, 5, 2, dwell_min=1, dwell_max=1, anchors=anchors
+        )
+        self.assertTrue(res["feasible"])
+        # 无锚点响应结构保持不变；有锚点仅追加 anchor_assignments。
+        self.assertNotIn("anchor_assignments", base)
+        for key in (
+            "drift",
+            "num_skips",
+            "skipped_reference_indices",
+            "residual_sum",
+            "max_abs_residual",
+            "boundaries",
+            "num_levels_used",
+        ):
+            self.assertEqual(res[key], base[key])
+        ev0, ev1 = res["anchor_assignments"]
+        self.assertEqual((ev0["reference_index"], ev0["sample_index"]), (2, 2))
+        self.assertEqual(ev0["level_order"], 2)
+        self.assertEqual((ev0["sample_start"], ev0["sample_end"]), (2, 3))
+        self.assertEqual(ev0["adopted_level"], 30)
+        self.assertEqual(ev0["observed"], 31)
+        self.assertEqual(ev0["residual"], 1)
+        self.assertEqual((ev1["reference_index"], ev1["sample_index"]), (5, 5))
+        self.assertEqual(ev1["level_order"], 5)
+        self.assertEqual(ev1["residual"], -2)
+
+    def test_anchor_overrides_lexicographic_boundary_tie_break(self) -> None:
+        # 无锚点最优取字典序最小边界 [1..7]；锚点 (3, 5) 迫使第 4 级
+        # 区间覆盖样本 5，边界变为 [1,2,3,6,7,8,9]，五级裁决顺序不变。
+        ref = [5] * 8
+        obs = [5] * 10
+        base = solve_alignment(ref, obs, 0, 0, 0, dwell_min=1, dwell_max=3)
+        self.assertEqual(base["boundaries"], [1, 2, 3, 4, 5, 6, 7])
+        res = solve_alignment(
+            ref,
+            obs,
+            0,
+            0,
+            0,
+            dwell_min=1,
+            dwell_max=3,
+            anchors=[{"reference_index": 3, "sample_index": 5}],
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["num_skips"], 0)
+        self.assertEqual(res["residual_sum"], 0)
+        self.assertEqual(res["boundaries"], [1, 2, 3, 6, 7, 8, 9])
+        ev = res["anchor_assignments"][0]
+        self.assertEqual((ev["sample_start"], ev["sample_end"]), (3, 6))
+        self.assertLessEqual(ev["sample_start"], 5)
+        self.assertLess(5, ev["sample_end"])
+
+    def test_anchored_level_cannot_be_skipped(self) -> None:
+        # 无锚点最优（残差 0）恰好跳过参考级 2；锚定级 2 后该方案被
+        # 排除——锚点优先于残差最优，本例中不存在其他合法对齐。
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        obs = [0, 10, 30, 30, 40, 50, 60, 70, 70]
+        base = solve_alignment(ref, obs, 0, 0, 2, dwell_min=1, dwell_max=2)
+        self.assertTrue(base["feasible"])
+        self.assertEqual(base["num_skips"], 1)
+        self.assertEqual(base["skipped_reference_indices"], [2])
+        res = solve_alignment(
+            ref,
+            obs,
+            0,
+            0,
+            2,
+            dwell_min=1,
+            dwell_max=2,
+            anchors=[{"reference_index": 2, "sample_index": 2}],
+        )
+        self.assertFalse(res["feasible"])
+        self.assertEqual(res["reason"], "no_alignment_with_anchors")
+        self.assertIn("message", res)
+
+    def test_anchor_forces_level_and_alignment_stays_feasible(self) -> None:
+        # 无锚点最优跳过级 2（残差 0）；锚点 (2, 2) 后级 2 必须采用，
+        # 最优解改为跳过级 3（残差和 0 -> 1），跳过数与裁决顺序不变。
+        ref = [0, 10, 20, 21, 40, 50, 60, 70]
+        obs = [0, 10, 21, 40, 50, 60, 70, 70]
+        base = solve_alignment(ref, obs, 0, 0, 2, dwell_min=1, dwell_max=2)
+        self.assertTrue(base["feasible"])
+        self.assertEqual(base["num_skips"], 1)
+        self.assertEqual(base["skipped_reference_indices"], [2])
+        self.assertEqual(base["residual_sum"], 0)
+        res = solve_alignment(
+            ref,
+            obs,
+            0,
+            0,
+            2,
+            dwell_min=1,
+            dwell_max=2,
+            anchors=[{"reference_index": 2, "sample_index": 2}],
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["num_skips"], 1)
+        self.assertEqual(res["skipped_reference_indices"], [3])
+        used = [lv["reference_index"] for lv in res["levels"]]
+        self.assertIn(2, used)
+        ev = res["anchor_assignments"][0]
+        self.assertEqual((ev["reference_index"], ev["sample_index"]), (2, 2))
+        self.assertEqual((ev["sample_start"], ev["sample_end"]), (2, 3))
+        self.assertEqual(ev["adopted_level"], 20)
+        self.assertEqual(ev["observed"], 21)
+        self.assertEqual(ev["residual"], 1)
+        # 与暴力枚举的带锚最优完全一致。
+        want = brute_force(ref, obs, 0, 0, 2, 1, 2, 2,
+                           anchors=[{"reference_index": 2, "sample_index": 2}])
+        self.assertIsNotNone(want)
+        self.assertEqual(used, want["used_indices"])
+        self.assertEqual(res["num_skips"], want["num_skips"])
+        self.assertEqual(res["residual_sum"], want["residual_sum"])
+
+    def test_anchor_on_first_and_last_level(self) -> None:
+        # 首级与末级锚点：区间分别须覆盖样本 0 与样本 N-1。
+        ref = [10, 20, 30, 40, 50, 60, 70, 80]
+        obs = [10, 10, 20, 30, 40, 50, 60, 70, 80, 80]
+        anchors = [
+            {"reference_index": 0, "sample_index": 1},
+            {"reference_index": 7, "sample_index": 8},
+        ]
+        res = solve_alignment(
+            ref, obs, 0, 0, 0, dwell_min=1, dwell_max=2, anchors=anchors
+        )
+        self.assertTrue(res["feasible"])
+        ev_first, ev_last = res["anchor_assignments"]
+        self.assertEqual(ev_first["level_order"], 0)
+        self.assertEqual((ev_first["sample_start"], ev_first["sample_end"]), (0, 2))
+        self.assertEqual(ev_last["reference_index"], 7)
+        self.assertEqual(
+            (ev_last["sample_start"], ev_last["sample_end"]), (8, 10)
+        )
+
+    def test_three_anchors(self) -> None:
+        ref = [10, 20, 30, 40, 50, 60, 70, 80]
+        obs = [12, 19, 31, 38, 52, 58, 71, 79]
+        anchors = [
+            {"reference_index": 0, "sample_index": 0},
+            {"reference_index": 3, "sample_index": 3},
+            {"reference_index": 7, "sample_index": 7},
+        ]
+        res = solve_alignment(
+            ref, obs, -5, 5, 2, dwell_min=1, dwell_max=1, anchors=anchors
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(len(res["anchor_assignments"]), 3)
+
+    def test_infeasible_anchor_sample_out_of_level_reach(self) -> None:
+        # dwell 固定为 1 时样本 7 只能归属末级，锚定到首级必然不相容。
+        ref = [10, 20, 30, 40, 50, 60, 70, 80]
+        obs = [12, 19, 31, 38, 52, 58, 71, 79]
+        res = solve_alignment(
+            ref,
+            obs,
+            -5,
+            5,
+            2,
+            dwell_min=1,
+            dwell_max=1,
+            anchors=[{"reference_index": 0, "sample_index": 7}],
+        )
+        self.assertFalse(res["feasible"])
+        self.assertEqual(res["reason"], "no_alignment_with_anchors")
+
+
+class AnchorValidationTests(unittest.TestCase):
+    """锚点格式错误：越界、重复、次序冲突均为字段级 AlignmentError。"""
+
+    def _base(self) -> dict:
+        return dict(
+            reference=list(range(8)),
+            observations=list(range(8)),
+            drift_min=0,
+            drift_max=0,
+            residual_limit=0,
+        )
+
+    def test_reference_index_out_of_range(self) -> None:
+        kw = self._base()
+        kw["anchors"] = [{"reference_index": 8, "sample_index": 0}]
+        with self.assertRaises(AnchorValidationError) as ctx:
+            solve_alignment(**kw)
+        self.assertEqual(ctx.exception.field, "anchors[0].reference_index")
+        kw["anchors"] = [{"reference_index": -1, "sample_index": 0}]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+
+    def test_sample_index_out_of_range(self) -> None:
+        kw = self._base()
+        kw["anchors"] = [{"reference_index": 0, "sample_index": 8}]
+        with self.assertRaises(AnchorValidationError) as ctx:
+            solve_alignment(**kw)
+        self.assertEqual(ctx.exception.field, "anchors[0].sample_index")
+        kw["anchors"] = [{"reference_index": 0, "sample_index": -2}]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+
+    def test_duplicate_indices_rejected(self) -> None:
+        kw = self._base()
+        kw["anchors"] = [
+            {"reference_index": 2, "sample_index": 2},
+            {"reference_index": 2, "sample_index": 5},
+        ]
+        with self.assertRaises(AnchorValidationError) as ctx:
+            solve_alignment(**kw)
+        self.assertEqual(ctx.exception.field, "anchors[1].reference_index")
+        kw["anchors"] = [
+            {"reference_index": 2, "sample_index": 2},
+            {"reference_index": 4, "sample_index": 2},
+        ]
+        with self.assertRaises(AnchorValidationError) as ctx:
+            solve_alignment(**kw)
+        self.assertEqual(ctx.exception.field, "anchors[1].sample_index")
+
+    def test_order_conflicts_rejected(self) -> None:
+        kw = self._base()
+        kw["anchors"] = [
+            {"reference_index": 4, "sample_index": 2},
+            {"reference_index": 2, "sample_index": 5},
+        ]
+        with self.assertRaises(AnchorValidationError) as ctx:
+            solve_alignment(**kw)
+        self.assertEqual(ctx.exception.field, "anchors[1].reference_index")
+        kw["anchors"] = [
+            {"reference_index": 2, "sample_index": 5},
+            {"reference_index": 4, "sample_index": 2},
+        ]
+        with self.assertRaises(AnchorValidationError) as ctx:
+            solve_alignment(**kw)
+        self.assertEqual(ctx.exception.field, "anchors[1].sample_index")
+
+    def test_shape_and_type_errors(self) -> None:
+        kw = self._base()
+        kw["anchors"] = []
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = [
+            {"reference_index": i, "sample_index": i} for i in range(4)
+        ]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = "not-a-list"  # type: ignore[assignment]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = [5]  # type: ignore[list-item]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = [{"reference_index": 0}]  # 缺 sample_index
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = [
+            {"reference_index": 0, "sample_index": 0, "extra": 1}
+        ]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = [{"reference_index": 0.5, "sample_index": 0}]  # type: ignore[dict-item]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+        kw["anchors"] = [{"reference_index": 0, "sample_index": True}]  # type: ignore[dict-item]
+        with self.assertRaises(AnchorValidationError):
+            solve_alignment(**kw)
+
+    def test_anchor_error_is_alignment_error(self) -> None:
+        kw = self._base()
+        kw["anchors"] = [{"reference_index": 99, "sample_index": 0}]
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw)
+
+
+class AnchoredBruteForceComparisonTests(unittest.TestCase):
+    """随机带锚实例：DP 必须与穷举结果完全一致（含锚点归属证据）。"""
+
+    def test_random_anchored_cases(self) -> None:
+        rng = random.Random(20261005)
+        for trial in range(160):
+            R = rng.randint(8, 10)
+            N = rng.randint(8, 14)
+            ref = [rng.randint(0, 40) for _ in range(R)]
+            inner = list(range(1, R - 1))
+            rng.shuffle(inner)
+            skip_k = rng.randint(0, min(2, R - 2))
+            skipped_set = set(inner[:skip_k])
+            used = [i for i in range(R) if i not in skipped_set]
+            k = len(used)
+            if k > N:
+                used = list(range(R))
+                k = R
+            dwells = BruteForceComparisonTests._random_composition(
+                rng, k, N, 1, 3
+            )
+            if dwells is None:
+                continue
+            d = rng.randint(-3, 3)
+            obs: List[int] = []
+            for ri, L in zip(used, dwells):
+                level = ref[ri] + d
+                for _ in range(L):
+                    noise = rng.choice([0, 0, 0, 1, -1, 2, -2, 5])
+                    obs.append(level + noise)
+            limit = rng.choice([0, 1, 2, 3, 10])
+            d_lo = d - rng.randint(0, 3)
+            d_hi = d + rng.randint(0, 3)
+            anchors = self._random_anchors(rng, used, dwells, R, N)
+            with self.subTest(trial=trial, ref=ref, obs=obs, anchors=anchors):
+                _assert_matches_brute(
+                    self, ref, obs, d_lo, d_hi, limit, 1, 3, 2,
+                    anchors=anchors,
+                )
+
+    @staticmethod
+    def _random_anchors(
+        rng: random.Random,
+        used: List[int],
+        dwells: List[int],
+        R: int,
+        N: int,
+    ) -> List[dict]:
+        """一半概率从真值对齐采锚点（必相容），一半纯随机（可能不相容）。"""
+        k = rng.randint(1, 3)
+        if rng.random() < 0.5:
+            # 真值各级区间互不重叠且递增，样本天然互异且随级递增。
+            slots = rng.sample(range(len(used)), min(k, len(used)))
+            slots.sort()
+            anchors = []
+            start = 0
+            starts: List[int] = []
+            for L in dwells:
+                starts.append(start)
+                start += L
+            for slot in slots:
+                t = rng.randrange(starts[slot], starts[slot] + dwells[slot])
+                anchors.append(
+                    {"reference_index": used[slot], "sample_index": t}
+                )
+            return anchors
+        refs = sorted(rng.sample(range(R), k))
+        samples = sorted(rng.sample(range(N), k))
+        return [
+            {"reference_index": ri, "sample_index": si}
+            for ri, si in zip(refs, samples)
+        ]
+
+
 class BruteForceComparisonTests(unittest.TestCase):
     """随机小规模实例：DP 必须与穷举结果完全一致（含全部平局裁决）。"""
 
@@ -432,10 +862,16 @@ class BruteForceComparisonTests(unittest.TestCase):
             limit = rng.choice([0, 1, 2, 3, 10])
             d_lo = d - rng.randint(0, 3)
             d_hi = d + rng.randint(0, 3)
+            dwell_min = rng.randint(1, 2)
+            dwell_max = rng.randint(max(dwell_min, 2), 3)
+            max_skips = rng.randint(0, 2)
             with self.subTest(trial=trial, ref=ref, obs=obs,
-                              lo=d_lo, hi=d_hi, limit=limit):
+                              lo=d_lo, hi=d_hi, limit=limit,
+                              dwell=(dwell_min, dwell_max),
+                              max_skips=max_skips):
                 _assert_matches_brute(
-                    self, ref, obs, d_lo, d_hi, limit, 1, 3, 2
+                    self, ref, obs, d_lo, d_hi, limit,
+                    dwell_min, dwell_max, max_skips,
                 )
 
     @staticmethod

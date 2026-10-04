@@ -82,6 +82,106 @@ class AlignFromPayloadTests(unittest.TestCase):
         self.assertEqual(body["error"], "invalid_body")
 
 
+class AnchoredPayloadTests(unittest.TestCase):
+    """anchors 字段：可行证据、不相容结论与字段级录入错误。"""
+
+    def _anchored(self, anchors: Any) -> Dict[str, Any]:
+        payload = dict(FEASIBLE_PAYLOAD)
+        payload["anchors"] = anchors
+        return payload
+
+    def test_anchored_feasible_with_assignments(self) -> None:
+        payload = self._anchored(
+            [
+                {"reference_index": 0, "sample_index": 0},
+                {"reference_index": 7, "sample_index": 7},
+            ]
+        )
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        assignments = body["anchor_assignments"]
+        self.assertEqual(len(assignments), 2)
+        first, last = assignments
+        self.assertEqual((first["reference_index"], first["sample_index"]), (0, 0))
+        self.assertEqual(first["level_order"], 0)
+        self.assertEqual((first["sample_start"], first["sample_end"]), (0, 1))
+        self.assertEqual(first["observed"], 15)
+        self.assertEqual(first["adopted_level"], 15)
+        self.assertEqual(first["residual"], 0)
+        self.assertEqual((last["reference_index"], last["sample_index"]), (7, 7))
+        self.assertEqual(last["level_order"], 7)
+
+    def test_omitted_anchors_response_unchanged(self) -> None:
+        status, body = align_from_payload(FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertNotIn("anchor_assignments", body)
+
+    def test_anchors_null_treated_as_omitted(self) -> None:
+        payload = self._anchored(None)
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertNotIn("anchor_assignments", body)
+
+    def test_anchor_incompatible_is_explicit_conclusion(self) -> None:
+        # dwell=1 下样本 7 只能归属末级，锚定到首级格式合法但不相容。
+        payload = self._anchored([{"reference_index": 0, "sample_index": 7}])
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"], "no_alignment_with_anchors")
+        self.assertIn("message", body)
+
+    def test_anchor_out_of_range_is_field_error(self) -> None:
+        payload = self._anchored([{"reference_index": 8, "sample_index": 0}])
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 400)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["error"], "invalid_anchors")
+        self.assertEqual(body["field"], "anchors[0].reference_index")
+        self.assertIn("message", body)
+
+    def test_anchor_duplicate_is_field_error(self) -> None:
+        payload = self._anchored(
+            [
+                {"reference_index": 2, "sample_index": 2},
+                {"reference_index": 2, "sample_index": 5},
+            ]
+        )
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_anchors")
+        self.assertEqual(body["field"], "anchors[1].reference_index")
+
+    def test_anchor_order_conflict_is_field_error(self) -> None:
+        payload = self._anchored(
+            [
+                {"reference_index": 2, "sample_index": 5},
+                {"reference_index": 4, "sample_index": 2},
+            ]
+        )
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_anchors")
+        self.assertEqual(body["field"], "anchors[1].sample_index")
+
+    def test_anchor_shape_errors(self) -> None:
+        for bad in (
+            [],
+            [{"reference_index": i, "sample_index": i} for i in range(4)],
+            [{"reference_index": 0}],
+            [{"reference_index": 0, "sample_index": 0, "x": 1}],
+            [{"reference_index": 0, "sample_index": "0"}],
+            ["not-a-dict"],
+        ):
+            with self.subTest(anchors=bad):
+                status, body = align_from_payload(self._anchored(bad))
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"], "invalid_anchors")
+                self.assertTrue(body["field"].startswith("anchors"))
+
+
 class HttpEndToEndTests(unittest.TestCase):
     server: ThreadingHTTPServer
     thread: threading.Thread
@@ -136,6 +236,36 @@ class HttpEndToEndTests(unittest.TestCase):
         status, body = self._post(INFEASIBLE_PAYLOAD)
         self.assertEqual(status, 200)
         self.assertFalse(body["feasible"])
+
+    def test_anchored_roundtrip(self) -> None:
+        payload = dict(FEASIBLE_PAYLOAD)
+        payload["anchors"] = [{"reference_index": 3, "sample_index": 3}]
+        status, body = self._post(payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        (ev,) = body["anchor_assignments"]
+        self.assertEqual((ev["reference_index"], ev["sample_index"]), (3, 3))
+        self.assertLessEqual(ev["sample_start"], 3)
+        self.assertLess(3, ev["sample_end"])
+        self.assertEqual(ev["residual"], ev["observed"] - ev["adopted_level"])
+
+    def test_anchor_validation_error_roundtrip(self) -> None:
+        payload = dict(FEASIBLE_PAYLOAD)
+        payload["anchors"] = [
+            {"reference_index": 0, "sample_index": 0},
+            {"reference_index": 1, "sample_index": 0},  # 同一样本重复
+        ]
+        status, body = self._post(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_anchors")
+
+    def test_anchor_infeasible_roundtrip(self) -> None:
+        payload = dict(FEASIBLE_PAYLOAD)
+        payload["anchors"] = [{"reference_index": 7, "sample_index": 0}]
+        status, body = self._post(payload)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"], "no_alignment_with_anchors")
 
     def test_invalid_roundtrip(self) -> None:
         bad = dict(FEASIBLE_PAYLOAD)

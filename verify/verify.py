@@ -8,7 +8,11 @@
 3. HTTP 冒烟：对运行中的 API 提交
    - 一条可行轨迹（期望 feasible=true、漂移/区间/残差证据齐全），
    - 一条无解轨迹（期望 feasible=false 且给出明确结论），
-   - 一条非法请求（期望 HTTP 400）。
+   - 一条非法请求（期望 HTTP 400），
+   - 一条带硬锚点的可行轨迹（期望逐项锚定归属证据齐全），
+   - 一条锚点格式合法但与轨迹不相容的轨迹
+     （期望 feasible=false 且 reason=no_alignment_with_anchors），
+   - 一条锚点录入错误（期望 HTTP 400 与字段级 invalid_anchors 错误）。
 
 API 地址取环境变量 ``API_BASE_URL``（compose 中为 http://api:8000）；
 若该地址不可达且未显式要求使用远端服务，则在本地以随机端口临时启动
@@ -55,6 +59,46 @@ INVALID_CASE: Dict[str, Any] = {
     "drift_min": 0,
     "drift_max": 0,
     "residual_limit": 0,
+}
+
+# dwell 固定为 1 且 N == R：唯一对齐是第 i 级占据样本 i，
+# 因此锚点 (i, i) 必然相容，锚点 (0, 7) 必然不相容。
+ANCHORED_CASE: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [12, 19, 31, 38, 52, 58, 71, 79],
+    "drift_min": -5,
+    "drift_max": 5,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 1,
+    "anchors": [
+        {"reference_index": 2, "sample_index": 2},
+        {"reference_index": 5, "sample_index": 5},
+    ],
+}
+
+ANCHOR_INFEASIBLE_CASE: Dict[str, Any] = {
+    # 锚点格式合法，但样本 7 在唯一对齐中归属末级，不可能归属首级。
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [12, 19, 31, 38, 52, 58, 71, 79],
+    "drift_min": -5,
+    "drift_max": 5,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 1,
+    "anchors": [{"reference_index": 0, "sample_index": 7}],
+}
+
+ANCHOR_INVALID_CASE: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [12, 19, 31, 38, 52, 58, 71, 79],
+    "drift_min": -5,
+    "drift_max": 5,
+    "residual_limit": 2,
+    "anchors": [
+        {"reference_index": 2, "sample_index": 2},
+        {"reference_index": 2, "sample_index": 5},  # reference_index 重复
+    ],
 }
 
 
@@ -212,6 +256,65 @@ def stage_http_smoke(base_url: str) -> None:
     if status != 400:
         raise StageFailure(f"非法请求应返回 400，实际 status={status}")
     _log("smoke", "非法请求通过: 返回 HTTP 400 拒绝")
+
+    # 有锚点：可行且逐项锚定归属证据齐全。
+    status, body = _http_request(base_url, ANCHORED_CASE)
+    if status != 200 or not body.get("feasible"):
+        raise StageFailure(f"有锚点轨迹用例失败: status={status} body={body}")
+    assignments = body.get("anchor_assignments")
+    want_anchors = ANCHORED_CASE["anchors"]
+    if not isinstance(assignments, list) or len(assignments) != len(want_anchors):
+        raise StageFailure("有锚点轨迹缺少逐项锚定归属证据")
+    level_by_order = {lv["level_order"]: lv for lv in body["levels"]}
+    for want, got in zip(want_anchors, assignments):
+        if (
+            got.get("reference_index") != want["reference_index"]
+            or got.get("sample_index") != want["sample_index"]
+        ):
+            raise StageFailure(f"锚定归属证据与请求锚点不对应: {got}")
+        lv = level_by_order.get(got.get("level_order"))
+        if lv is None or lv["reference_index"] != want["reference_index"]:
+            raise StageFailure("锚定归属证据未指向采用该参考级的采样区间")
+        if not (
+            got.get("sample_start")
+            <= want["sample_index"]
+            < got.get("sample_end")
+        ):
+            raise StageFailure("锚定观测未落在锚定级的连续采样区间内")
+        if (got.get("sample_start"), got.get("sample_end")) != (
+            lv["sample_start"],
+            lv["sample_end"],
+        ):
+            raise StageFailure("锚定归属证据区间与对应级采样区间不一致")
+        if got.get("residual") != got.get("observed") - got.get(
+            "adopted_level"
+        ):
+            raise StageFailure("锚定归属证据残差与观测/采用电平不一致")
+    _log(
+        "smoke",
+        f"有锚点轨迹通过: {len(assignments)} 项锚定归属证据齐全",
+    )
+
+    # 有锚点：格式合法但与轨迹不相容 -> 明确无解结论（区分录入错误）。
+    status, body = _http_request(base_url, ANCHOR_INFEASIBLE_CASE)
+    if status != 200 or body.get("feasible") is not False:
+        raise StageFailure(
+            f"锚点不相容用例失败: status={status} body={body}"
+        )
+    if body.get("reason") != "no_alignment_with_anchors":
+        raise StageFailure("锚点不相容缺少明确结论 reason")
+    _log("smoke", "锚点不相容轨迹通过: 返回明确无解结论")
+
+    # 锚点录入错误（重复索引）-> 字段级 400。
+    status, body = _http_request(base_url, ANCHOR_INVALID_CASE)
+    if status != 400 or body.get("error") != "invalid_anchors":
+        raise StageFailure(
+            f"锚点非法请求应返回 400 invalid_anchors，实际 "
+            f"status={status} body={body}"
+        )
+    if not str(body.get("field", "")).startswith("anchors"):
+        raise StageFailure("锚点非法请求缺少字段级定位 field")
+    _log("smoke", "锚点非法请求通过: 返回字段级 HTTP 400 错误")
 
 
 def main() -> int:
