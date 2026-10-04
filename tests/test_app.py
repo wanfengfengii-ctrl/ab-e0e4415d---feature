@@ -31,6 +31,28 @@ INFEASIBLE_PAYLOAD: Dict[str, Any] = {
     "residual_limit": 1,
 }
 
+# N=15、dwell_min=2 迫使 1 个内部跳过；无锚点时跳 R3，锚定 (R3, 采样6)
+# 后必须改跳等价电平 R4（R3=R4=300）。
+ANCHORED_PAYLOAD: Dict[str, Any] = {
+    "reference_levels": [0, 100, 200, 300, 300, 400, 500, 600],
+    "observations": [0, 0, 100, 100, 200, 200, 300, 300,
+                     400, 400, 500, 500, 600, 600, 600],
+    "drift_min": 0,
+    "drift_max": 0,
+    "residual_limit": 0,
+    "dwell_min": 2,
+    "dwell_max": 3,
+    "anchors": [[3, 6]],
+}
+
+# 同一轨迹锚定一个无法被满足的归属（采样 6 归 R2，停留约束下不可达）。
+ANCHORED_INCOMPATIBLE_PAYLOAD: Dict[str, Any] = {
+    **{
+        k: v for k, v in ANCHORED_PAYLOAD.items() if k != "anchors"
+    },
+    "anchors": [[2, 6]],
+}
+
 
 class AlignFromPayloadTests(unittest.TestCase):
     def test_feasible(self) -> None:
@@ -80,6 +102,97 @@ class AlignFromPayloadTests(unittest.TestCase):
         status, body = align_from_payload("not-a-dict")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_body")
+
+    def test_anchored_request_returns_evidence(self) -> None:
+        status, body = align_from_payload(ANCHORED_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        # 锚点禁止跨过 R3：无锚点时本会跳过 R3。
+        self.assertEqual(body["skipped_reference_indices"], [4])
+        assignments = body["anchor_assignments"]
+        self.assertEqual(len(assignments), 1)
+        ev = assignments[0]
+        self.assertEqual(ev["reference_index"], 3)
+        self.assertEqual(ev["sample_index"], 6)
+        self.assertLessEqual(ev["sample_start"], 6)
+        self.assertLess(6, ev["sample_end"])
+        self.assertEqual(ev["assigned_level_order"], 3)
+        anchored = [lv for lv in body["levels"] if lv["anchored"]]
+        self.assertEqual(len(anchored), 1)
+        self.assertEqual(anchored[0]["reference_index"], 3)
+
+    def test_anchored_incompatible_is_explicit_conclusion(self) -> None:
+        status, body = align_from_payload(ANCHORED_INCOMPATIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"], "anchors_incompatible")
+        self.assertIn("message", body)
+
+    def test_anchor_out_of_range_field_error(self) -> None:
+        bad = dict(ANCHORED_PAYLOAD)
+        bad["anchors"] = [[8, 0]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_anchors")
+        fields = [e["field"] for e in body["errors"]]
+        self.assertIn("anchors[0].reference_index", fields)
+
+        bad = dict(ANCHORED_PAYLOAD)
+        bad["anchors"] = [[0, 15]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        fields = [e["field"] for e in body["errors"]]
+        self.assertIn("anchors[0].sample_index", fields)
+
+    def test_anchor_duplicate_and_order_field_errors(self) -> None:
+        bad = dict(ANCHORED_PAYLOAD)
+        bad["anchors"] = [[3, 1], [3, 6]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_anchors")
+        messages = " ".join(e["message"] for e in body["errors"])
+        self.assertIn("reference_index", messages)
+
+        bad = dict(ANCHORED_PAYLOAD)
+        bad["anchors"] = [[4, 6], [3, 8]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        messages = " ".join(e["message"] for e in body["errors"])
+        self.assertIn("reference_index", messages)
+
+        bad = dict(ANCHORED_PAYLOAD)
+        bad["anchors"] = [[3, 9], [4, 8]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        messages = " ".join(e["message"] for e in body["errors"])
+        self.assertIn("sample_index", messages)
+
+    def test_anchor_shape_field_errors(self) -> None:
+        for bad_anchors in [[], [[1]], [[1, 2, 3]],
+                            [[1, "x"]], "nope", [[1, 2], [3, 4],
+                                                  [5, 6], [7, 0]]]:
+            bad = dict(ANCHORED_PAYLOAD)
+            bad["anchors"] = bad_anchors
+            status, body = align_from_payload(bad)
+            self.assertEqual(
+                status, 400, msg=f"anchors={bad_anchors} body={body}"
+            )
+            self.assertEqual(body["error"], "invalid_anchors")
+            self.assertTrue(body["errors"])
+
+    def test_anchor_field_error_does_not_swallow_other_shape(self) -> None:
+        # anchors 结构错误时直接报字段错误，不依赖其他字段是否合法。
+        status, body = align_from_payload({"anchors": [[1, 2]]})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "missing_fields")
+
+    def test_explicit_null_anchors_equivalent_to_omitted(self) -> None:
+        payload = dict(FEASIBLE_PAYLOAD)
+        payload["anchors"] = None
+        status, body = align_from_payload(payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertNotIn("anchor_assignments", body)
 
 
 class HttpEndToEndTests(unittest.TestCase):
@@ -136,6 +249,32 @@ class HttpEndToEndTests(unittest.TestCase):
         status, body = self._post(INFEASIBLE_PAYLOAD)
         self.assertEqual(status, 200)
         self.assertFalse(body["feasible"])
+
+    def test_anchored_roundtrip(self) -> None:
+        status, body = self._post(ANCHORED_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["skipped_reference_indices"], [4])
+        ev = body["anchor_assignments"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["reference_index"], 3)
+        self.assertEqual(ev[0]["sample_index"], 6)
+        self.assertLessEqual(ev[0]["sample_start"], 6)
+        self.assertLess(6, ev[0]["sample_end"])
+
+    def test_anchored_incompatible_roundtrip(self) -> None:
+        status, body = self._post(ANCHORED_INCOMPATIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"], "anchors_incompatible")
+
+    def test_anchors_field_error_roundtrip(self) -> None:
+        bad = dict(ANCHORED_PAYLOAD)
+        bad["anchors"] = [[3, 1], [3, 2]]
+        status, body = self._post(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_anchors")
+        self.assertTrue(body["errors"])
 
     def test_invalid_roundtrip(self) -> None:
         bad = dict(FEASIBLE_PAYLOAD)

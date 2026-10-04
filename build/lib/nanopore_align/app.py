@@ -14,7 +14,7 @@ import json
 import logging
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .alignment import AlignmentError, solve_alignment
 
@@ -29,6 +29,7 @@ _ALLOWED_FIELDS = {
     "dwell_min",
     "dwell_max",
     "max_skips",
+    "anchors",
 }
 
 _REQUIRED_FIELDS = (
@@ -71,6 +72,17 @@ def align_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     if "max_skips" in payload:
         kwargs["max_skips"] = payload["max_skips"]
 
+    anchors_error = _anchors_field_error(
+        payload.get("anchors"),
+        payload.get("reference_levels"),
+        payload.get("observations"),
+    )
+    if anchors_error is not None:
+        return anchors_error
+    # 显式 null 与省略等价（_anchors_field_error 已对非数组形态拦截）。
+    if isinstance(payload.get("anchors"), list):
+        kwargs["anchors"] = [tuple(a) for a in payload["anchors"]]
+
     try:
         result = solve_alignment(**kwargs)
     except AlignmentError as exc:
@@ -79,6 +91,86 @@ def align_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         return _bad_request("invalid_request", f"字段类型错误: {exc}")
 
     return HTTPStatus.OK, result
+
+
+def _anchors_field_error(
+    anchors: Any, reference_levels: Any, observations: Any
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """校验可选 anchors 字段，返回字段级 400 响应或 None（通过/缺省）。"""
+    if anchors is None:
+        return None
+
+    errors = []
+
+    def add(field: str, message: str) -> None:
+        errors.append({"field": field, "message": message})
+
+    if not isinstance(anchors, list):
+        add("anchors", "必须是包含 1 至 3 个标记的数组")
+        return _field_errors_response(errors)
+    if not 1 <= len(anchors) <= 3:
+        add("anchors", "必须包含 1 至 3 个标记")
+
+    ref_len = len(reference_levels) if isinstance(reference_levels, list) else None
+    obs_len = len(observations) if isinstance(observations, list) else None
+
+    normalized: List[Tuple[int, int]] = []
+    for pos, item in enumerate(anchors):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            add(f"anchors[{pos}]", "必须是 [reference_index, sample_index] 两个整数")
+            continue
+        ref_i, sample_t = item
+        if isinstance(ref_i, bool) or not isinstance(ref_i, int):
+            add(f"anchors[{pos}].reference_index", "必须为整数")
+        elif ref_len is not None and not 0 <= ref_i < ref_len:
+            add(
+                f"anchors[{pos}].reference_index",
+                f"越界：合法范围为 0 至 {ref_len - 1}",
+            )
+        if isinstance(sample_t, bool) or not isinstance(sample_t, int):
+            add(f"anchors[{pos}].sample_index", "必须为整数")
+        elif obs_len is not None and not 0 <= sample_t < obs_len:
+            add(
+                f"anchors[{pos}].sample_index",
+                f"越界：合法范围为 0 至 {obs_len - 1}",
+            )
+        if isinstance(ref_i, int) and not isinstance(ref_i, bool) and isinstance(
+            sample_t, int
+        ) and not isinstance(sample_t, bool):
+            normalized.append((ref_i, sample_t))
+
+    if len(normalized) == len(anchors) and len(normalized) > 1:
+        ref_indices = [ri for ri, _ in normalized]
+        sample_indices = [st for _, st in normalized]
+        if len(set(ref_indices)) != len(ref_indices):
+            add("anchors", "reference_index 必须两两互异，不得重复")
+        if len(set(sample_indices)) != len(sample_indices):
+            add("anchors", "sample_index 必须两两互异，不得重复")
+        if any(
+            ref_indices[k] >= ref_indices[k + 1]
+            for k in range(len(ref_indices) - 1)
+        ):
+            add("anchors", "reference_index 必须严格递增")
+        if any(
+            sample_indices[k] >= sample_indices[k + 1]
+            for k in range(len(sample_indices) - 1)
+        ):
+            add("anchors", "sample_index 必须严格递增")
+
+    if errors:
+        return _field_errors_response(errors)
+    return None
+
+
+def _field_errors_response(
+    errors: List[Dict[str, str]]
+) -> Tuple[int, Dict[str, Any]]:
+    return HTTPStatus.BAD_REQUEST, {
+        "feasible": False,
+        "error": "invalid_anchors",
+        "message": "anchors 字段校验失败",
+        "errors": errors,
+    }
 
 
 def _bad_request(code: str, message: str) -> Tuple[int, Dict[str, Any]]:
